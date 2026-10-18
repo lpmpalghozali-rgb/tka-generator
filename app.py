@@ -10,6 +10,10 @@ from core import (
     SCHOOL_NAME, QUESTION_TYPES, OPTION_FORMATS, DIFFICULTIES,
     BATCH_SIZE, GenerationError, generate_package, build_docx, build_preview_html,
 )
+from storage import (
+    DEFAULT_DIR, StorageError, save_package, load_package, delete_package, list_packages,
+    dumps_package, loads_package,
+)
 
 st.set_page_config(page_title="TKA Generator AI | SMA ISLAM AL-GHOZALI", page_icon="📘", layout="wide")
 
@@ -229,6 +233,82 @@ SUBJECT_DEFAULT_LANGUAGE = {
     "Bahasa Arab": "Arab", "Bahasa Sunda": "Sunda", "Bahasa Inggris": "Inggris",
 }
 
+# Nilai awal semua kolom isian; dipakai tombol Reset (API key sengaja tidak ikut direset).
+FORM_DEFAULTS = {
+    "subject_selector": SUBJECTS[0], "grade_selector": "10", "semester_selector": "Semester 1",
+    "curriculum_input": "", "count_input": 10, "qtypes_input": ["Pilihan Ganda"],
+    "difficulty_input": "Campuran", "option_format_input": OPTION_FORMATS[0],
+    "inc_key": True, "inc_explanations": True, "inc_blueprint": True,
+    "inc_analysis": True, "inc_rubric": True, "inc_summary": True, "extra_input": "",
+}
+
+
+def make_docx(data, meta):
+    return build_docx(
+        data, meta, include_key=meta.get("include_key", True),
+        include_explanations=meta.get("include_explanations", True),
+        include_blueprint=meta.get("include_blueprint", True),
+        include_analysis=meta.get("include_analysis", True),
+        include_rubric=meta.get("include_rubric", True),
+        include_summary=meta.get("include_summary", True))
+
+
+def flash(kind, text):
+    """Pesan yang ditampilkan di bagian atas pada render berikutnya (dipakai oleh callback)."""
+    st.session_state["_flash"] = (kind, text)
+
+
+def reset_all():
+    """Kosongkan hasil dan kembalikan seluruh pilihan form ke nilai awal."""
+    for key, value in FORM_DEFAULTS.items():
+        st.session_state[key] = list(value) if isinstance(value, list) else value
+    for key in [k for k in st.session_state if str(k).startswith("topic_")]:
+        del st.session_state[key]  # topik terisi ulang otomatis dari silabus
+    for key in ("_lang_subject", "_topic_selection_key", "_save_msg"):
+        st.session_state.pop(key, None)
+    st.session_state.update(generated_data=None, generated_meta=None, generated_docx=None, saved_name=None)
+    flash("success", "Form dan hasil sudah direset. API key tidak berubah.")
+
+
+def apply_package(data, meta, saved_name):
+    st.session_state.generated_data = data
+    st.session_state.generated_meta = meta
+    st.session_state.generated_docx = make_docx(data, meta)
+    st.session_state.saved_name = saved_name
+
+
+def load_saved(name):
+    try:
+        data, meta = load_package(name)
+        apply_package(data, meta, name)
+        flash("success", "Paket dimuat. Lihat bagian **Hasil generator** di bawah.")
+    except (StorageError, OSError) as exc:
+        flash("error", f"Gagal memuat paket: {exc}")
+
+
+def delete_saved(name):
+    try:
+        delete_package(name)
+        if st.session_state.get("saved_name") == name:
+            st.session_state.saved_name = None
+        flash("success", "Paket dihapus dari folder lokal.")
+    except (StorageError, OSError) as exc:
+        flash("error", f"Gagal menghapus paket: {exc}")
+    st.session_state.pop("saved_choice", None)
+    st.session_state["confirm_delete"] = False
+
+
+def save_current():
+    data, meta = st.session_state.get("generated_data"), st.session_state.get("generated_meta")
+    if not (data and meta):
+        return
+    try:
+        # saved_name terisi -> berkas yang sama ditimpa (tidak menumpuk duplikat)
+        st.session_state.saved_name = save_package(data, meta, name=st.session_state.get("saved_name"))
+        st.session_state["_save_msg"] = ("success", f"Tersimpan: `{st.session_state.saved_name}`")
+    except OSError as exc:
+        st.session_state["_save_msg"] = ("error", f"Gagal menyimpan ke folder lokal: {exc}")
+
 
 def get_api_key():
     """Read API key from Streamlit Cloud Secrets or local environment."""
@@ -377,6 +457,48 @@ if not api_key:
     st.error("Masukkan Groq API Key pribadi pada panel Pengaturan, atau minta pengelola mengonfigurasi API key default melalui Streamlit Secrets.")
     st.stop()
 
+# --------------------------------------------------------------- paket tersimpan
+_flash = st.session_state.pop("_flash", None)
+if _flash:
+    getattr(st, _flash[0])(_flash[1])
+
+for state_key in ("generated_data", "generated_meta", "generated_docx", "saved_name"):
+    st.session_state.setdefault(state_key, None)
+
+with st.expander("📂 Paket soal tersimpan (lokal)"):
+    st.checkbox("Simpan otomatis setiap selesai membuat soal", value=True, key="auto_save")
+    st.caption(f"Folder penyimpanan: `{DEFAULT_DIR}` (komputer/server tempat aplikasi berjalan). "
+               "Di Streamlit Cloud folder ini bersifat sementara; gunakan tombol **Unduh salinan (.json)** "
+               "pada hasil untuk menyimpan ke komputer Anda.")
+    try:
+        saved_list = list_packages()
+    except OSError:
+        saved_list = []
+    if saved_list:
+        info = {p["name"]: p for p in saved_list}
+        choice = st.selectbox(
+            "Pilih paket", list(info), key="saved_choice",
+            format_func=lambda n: (f'{info[n]["saved_at"]} · {info[n]["subject"]} Kelas {info[n]["grade"]} · '
+                                   f'{info[n]["count"]} soal ({info[n]["qtype"]})'))
+        e1, e2, e3 = st.columns([1, 1, 2])
+        e1.button("📥 Muat", on_click=load_saved, args=(choice,), use_container_width=True)
+        confirm = e3.checkbox("Ya, hapus paket ini", key="confirm_delete")
+        e2.button("🗑️ Hapus", on_click=delete_saved, args=(choice,), disabled=not confirm,
+                  use_container_width=True)
+    else:
+        st.caption("Belum ada paket tersimpan.")
+    uploaded = st.file_uploader("Impor paket dari komputer (.json)", type=["json"], key="import_uploader")
+    if uploaded is not None:
+        upload_id = getattr(uploaded, "file_id", None) or (uploaded.name, uploaded.size)
+        if st.session_state.get("_imported_id") != upload_id:
+            st.session_state["_imported_id"] = upload_id
+            try:
+                imported_data, imported_meta = loads_package(uploaded.getvalue())
+                apply_package(imported_data, imported_meta, None)
+                st.success("Paket diimpor. Lihat bagian **Hasil generator** di bawah.")
+            except StorageError as exc:
+                st.error(f"Gagal mengimpor: {exc}")
+
 # ------------------------------------------------------------------------ form
 st.markdown('<div class="section-label">01 / Rancang paket soal</div>', unsafe_allow_html=True)
 st.markdown("## Atur materi dan format asesmen")
@@ -398,7 +520,8 @@ with col2:
         "Bahasa output soal", OUTPUT_LANGUAGES, key="language_selector",
         help="Bahasa untuk soal, opsi, kunci, pembahasan, kisi-kisi, rubrik, dan rangkuman. Otomatis mengikuti mata pelajaran bahasa, dapat diubah.",
     )
-    curriculum = st.text_input("Kurikulum / acuan (opsional)", placeholder="Contoh: Kurikulum Merdeka")
+    curriculum = st.text_input("Kurikulum / acuan (opsional)", key="curriculum_input",
+                               placeholder="Contoh: Kurikulum Merdeka")
 
 suggested_topic = SILABUS.get(subject, {}).get(grade, {}).get(
     semester, TOPIC_SUGGESTIONS.get(subject, {}).get(grade, ""))
@@ -412,33 +535,36 @@ topic = st.text_area("Topik / materi (terisi otomatis, bisa diedit)", key=topic_
 with st.form("generator_form"):
     f1, f2 = st.columns(2)
     with f1:
-        count = st.number_input("Jumlah soal", min_value=1, max_value=100, value=10, step=1)
+        count = st.number_input("Jumlah soal", min_value=1, max_value=100, value=10, step=1, key="count_input")
         qtypes = st.multiselect(
             "Jenis soal (bisa pilih lebih dari satu)", QUESTION_TYPES, default=["Pilihan Ganda"],
-            help="Jika lebih dari satu jenis, soal divariasikan secara bergantian dalam satu paket.",
+            key="qtypes_input",
+            help="Jika lebih dari satu jenis, soal dikelompokkan per jenis (A. Pilihan Ganda, B. Essay, dst.) dengan jumlah dibagi rata.",
         )
     with f2:
-        difficulty = st.selectbox("Tingkat kesulitan", DIFFICULTIES, index=3)
-        option_format = st.selectbox("Opsi jawaban Pilihan Ganda", OPTION_FORMATS,
+        difficulty = st.selectbox("Tingkat kesulitan", DIFFICULTIES, index=3, key="difficulty_input")
+        option_format = st.selectbox("Opsi jawaban Pilihan Ganda", OPTION_FORMATS, key="option_format_input",
                                      help="Hanya berlaku untuk soal Pilihan Ganda.")
     st.markdown("**Bagian dokumen Word**")
     a, b, c = st.columns(3)
     with a:
-        include_key = st.checkbox("Kunci jawaban", value=True)
-        include_explanations = st.checkbox("Pembahasan", value=True)
+        include_key = st.checkbox("Kunci jawaban", value=True, key="inc_key")
+        include_explanations = st.checkbox("Pembahasan", value=True, key="inc_explanations")
     with b:
-        include_blueprint = st.checkbox("Kisi-kisi", value=True)
-        include_analysis = st.checkbox("Analisis kualitatif", value=True)
+        include_blueprint = st.checkbox("Kisi-kisi", value=True, key="inc_blueprint")
+        include_analysis = st.checkbox("Analisis kualitatif", value=True, key="inc_analysis")
     with c:
-        include_rubric = st.checkbox("Rubrik penilaian", value=True)
-        include_summary = st.checkbox("Rangkuman materi", value=True)
+        include_rubric = st.checkbox("Rubrik penilaian", value=True, key="inc_rubric")
+        include_summary = st.checkbox("Rangkuman materi", value=True, key="inc_summary")
     extra_instructions = st.text_area(
-        "Instruksi tambahan (opsional)",
+        "Instruksi tambahan (opsional)", key="extra_input",
         placeholder="Contoh: gunakan stimulus kontekstual dan ukur penalaran tingkat tinggi.")
-    submitted = st.form_submit_button("✨ Buat Soal", type="primary", use_container_width=True)
-
-for state_key in ("generated_data", "generated_meta", "generated_docx"):
-    st.session_state.setdefault(state_key, None)
+    b1, b2 = st.columns([3, 1])
+    with b1:
+        submitted = st.form_submit_button("✨ Buat Soal", type="primary", use_container_width=True)
+    with b2:
+        st.form_submit_button("↺ Reset", on_click=reset_all, use_container_width=True,
+                              help="Kosongkan hasil dan kembalikan semua pilihan ke awal. API key tidak berubah.")
 
 # ------------------------------------------------------------------- generation
 if submitted:
@@ -472,13 +598,14 @@ if submitted:
                 "include_blueprint": include_blueprint, "include_analysis": include_analysis,
                 "include_rubric": include_rubric, "include_summary": include_summary,
             }
-            st.session_state.generated_data = data
-            st.session_state.generated_meta = meta
-            st.session_state.generated_docx = build_docx(
-                data, meta, include_key=include_key, include_explanations=include_explanations,
-                include_blueprint=include_blueprint, include_analysis=include_analysis,
-                include_rubric=include_rubric, include_summary=include_summary)
+            apply_package(data, meta, None)
             st.success(f"Paket soal berhasil dibuat dengan model `{model}`.")
+            if st.session_state.get("auto_save", True):
+                try:
+                    st.session_state.saved_name = save_package(data, meta)
+                    st.info(f"Tersimpan otomatis di folder lokal: `{st.session_state.saved_name}`")
+                except OSError as exc:
+                    st.warning(f"Soal berhasil dibuat, tetapi gagal disimpan ke folder lokal: {exc}")
         except GenerationError as exc:
             st.error(f"Gagal memproses jawaban AI: {exc}")
             st.warning(f"Soal dibuat per batch ({BATCH_SIZE} soal per panggilan) dengan beberapa percobaan otomatis. "
@@ -513,7 +640,8 @@ if data and meta:
 
     safe_subject = re.sub(r"[^A-Za-z0-9_-]+", "_", meta["subject"]).strip("_")
     filename = f"TKA_SMA_ISLAM_AL_GHOZALI_{safe_subject}_Kelas_{meta['grade']}_{datetime.now().strftime('%Y%m%d_%H%M')}.docx"
-    st.download_button(
+    d1, d2, d3 = st.columns(3)
+    d1.download_button(
         "⬇️ Ekspor ke Microsoft Word (.docx)",
         data=st.session_state.generated_docx,
         file_name=filename,
@@ -521,6 +649,17 @@ if data and meta:
         type="primary",
         use_container_width=True,
     )
+    d2.button("💾 Simpan ke folder lokal", on_click=save_current, use_container_width=True)
+    d3.download_button(
+        "⬇️ Unduh salinan (.json)",
+        data=dumps_package(data, meta),
+        file_name=filename.replace(".docx", ".json"),
+        mime="application/json",
+        use_container_width=True,
+    )
+    _save_msg = st.session_state.pop("_save_msg", None)
+    if _save_msg:
+        getattr(st, _save_msg[0])(_save_msg[1])
 
 st.divider()
 st.caption("Hasil AI perlu ditinjau guru sebelum digunakan. Aplikasi ini menghasilkan latihan orisinal dan bukan soal resmi TKA.")
