@@ -86,7 +86,7 @@ def test_generation_mixed_types():
     assert all(b["question_type"] == q["type"] for b, q in zip(data["blueprint"], data["questions"]))
     pg = data["questions"][0]
     assert pg["answer"] == "B" and list(pg["options"]) == list("ABCDE")
-    assert data["questions"][2]["answer"] == "Benar"
+    assert data["questions"][4]["answer"] == "Benar"  # urutan: PG, PG, Essay, Essay, B/S, B/S, Isian
     assert "\\n" not in data["material_summary"] and data["material_summary"].count("\n\n") == 2
 
 
@@ -138,6 +138,55 @@ def test_missing_passage_rejected():
         assert "wacana" in str(e).lower()
     else:
         raise AssertionError("harus gagal")
+
+
+def test_plan_types_grouped_per_type():
+    plan = core.plan_types(["Essay", "Pilihan Ganda"], 20)  # urutan klik tidak berpengaruh
+    assert plan == ["Pilihan Ganda"] * 10 + ["Essay"] * 10
+    assert core.plan_types(["Pilihan Ganda", "Essay"], 7) == ["Pilihan Ganda"] * 4 + ["Essay"] * 3
+    assert core.plan_types([], 3) == ["Pilihan Ganda"] * 3
+
+
+def test_merge_regroups_when_ai_deviates_from_plan():
+    cfg = base_cfg(count=6, qtypes=["Pilihan Ganda", "Essay"])
+    types = ["Essay", "Pilihan Ganda", "Essay", "Pilihan Ganda", "Pilihan Ganda", "Essay"]
+    plan = list(types)
+    b1 = core.normalize_batch(fake_batch(list(enumerate(plan[:3], 1)), option_keys="ABCDE"),
+                              plan[:3], "ABCDE", cfg["qtypes"], "Fisika", 1)
+    b2 = core.normalize_batch(fake_batch(list(enumerate(plan[3:], 4)), option_keys="ABCDE"),
+                              plan[3:], "ABCDE", cfg["qtypes"], "Fisika", 2)
+    data = core.merge_batches([b1, b2], cfg)
+    assert [q["type"] for q in data["questions"]] == ["Pilihan Ganda"] * 3 + ["Essay"] * 3
+    assert [q["number"] for q in data["questions"]] == list(range(1, 7))
+    assert [b["question_type"] for b in data["blueprint"]] == [q["type"] for q in data["questions"]]
+    assert [a["number"] for a in data["qualitative_analysis"]] == list(range(1, 7))
+
+
+def test_docx_sections_pg_then_essay():
+    from docx import Document
+    cfg, calls = base_cfg(count=20, qtypes=["Pilihan Ganda", "Essay"]), []
+    data = core.generate_package(make_llm(cfg, calls), cfg)
+    assert [q["type"] for q in data["questions"]] == ["Pilihan Ganda"] * 10 + ["Essay"] * 10
+    secs = core.type_sections(data["questions"])
+    assert [s["label"] for s in secs] == ["A. PILIHAN GANDA (Soal No. 1–10)", "B. ESSAY (Soal No. 11–20)"]
+    meta = {"subject": "Fisika", "grade": "10", "semester": "Semester 1", "topic": "t",
+            "output_language": "Indonesia", "difficulty": "Campuran", "qtype": "Pilihan Ganda, Essay"}
+    doc = Document(BytesIO(core.build_docx(data, meta)))
+    headings = [p.text for p in doc.paragraphs if p.style.name == "Heading 2"]
+    # soal, kunci, pembahasan, rubrik, kisi-kisi, analisis -> masing-masing A lalu B
+    assert headings.count("A. PILIHAN GANDA (Soal No. 1–10)") == 6
+    assert headings.count("B. ESSAY (Soal No. 11–20)") == 6
+    assert "Jumlah soal: 20 (Pilihan Ganda: 10, Essay: 10)" in doc.tables[0].cell(0, 1).text
+    q_pg, q_es = doc.tables[1], doc.tables[2]
+    assert [r.cells[0].text for r in q_pg.rows] == [str(n) for n in range(1, 11)]
+    assert [r.cells[0].text for r in q_es.rows] == [str(n) for n in range(11, 21)]
+    assert all("A. " in r.cells[1].text for r in q_pg.rows)
+    assert all("Jawaban:" in r.cells[1].text for r in q_es.rows)
+    key_grid = doc.tables[3]  # kunci PG: kisi ringkas No./Jawaban
+    assert [c.text for c in key_grid.rows[0].cells] == ["No."] + [str(n) for n in range(1, 11)]
+    assert [c.text for c in key_grid.rows[1].cells] == ["Jawaban"] + ["B"] * 10
+    html = core.build_preview_html(data)
+    assert html.index("A. PILIHAN GANDA") < html.index("B. ESSAY")
 
 
 if __name__ == "__main__":

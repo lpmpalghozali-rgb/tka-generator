@@ -65,9 +65,49 @@ def canonical_type(value):
     return _TYPE_ALIASES.get(str(value or "").strip().casefold())
 
 
+TYPE_TITLES = {
+    "Pilihan Ganda": "PILIHAN GANDA", "Essay": "ESSAY",
+    "Benar/Salah": "BENAR/SALAH", "Isian Singkat": "ISIAN SINGKAT",
+}
+TYPE_INSTRUCTIONS = {
+    "Pilihan Ganda": "Pilihlah satu jawaban yang paling tepat.",
+    "Essay": "Jawablah dengan lengkap dan jelas sesuai pertanyaan.",
+    "Benar/Salah": "Tentukan apakah pernyataan berikut Benar atau Salah.",
+    "Isian Singkat": "Isilah dengan jawaban yang singkat dan tepat.",
+}
+
+
+def _type_rank(qtype):
+    return QUESTION_TYPES.index(qtype) if qtype in QUESTION_TYPES else len(QUESTION_TYPES)
+
+
 def plan_types(qtypes, total):
-    qtypes = list(qtypes) or ["Pilihan Ganda"]
-    return [qtypes[i % len(qtypes)] for i in range(total)]
+    """Rencana jenis soal per nomor, dikelompokkan per jenis.
+
+    Contoh 20 soal PG + Essay -> nomor 1-10 Pilihan Ganda, 11-20 Essay.
+    Urutan jenis selalu mengikuti QUESTION_TYPES (bukan urutan klik pengguna).
+    """
+    chosen = sorted(dict.fromkeys(qtypes), key=_type_rank) or ["Pilihan Ganda"]
+    base, extra = divmod(total, len(chosen))
+    plan = []
+    for i, qtype in enumerate(chosen):
+        plan += [qtype] * (base + (1 if i < extra else 0))
+    return plan
+
+
+def type_sections(questions):
+    """Bagian soal per jenis: [{"type", "numbers", "label"}], mis. 'A. PILIHAN GANDA (Soal No. 1–10)'."""
+    groups = {}
+    for i, q in enumerate(questions, 1):
+        groups.setdefault(q["type"], []).append(i)
+    sections = []
+    for k, qtype in enumerate(sorted(groups, key=_type_rank)):
+        nums = groups[qtype]
+        sections.append({
+            "type": qtype, "numbers": nums,
+            "label": f'{chr(65 + k)}. {TYPE_TITLES.get(qtype, qtype.upper())} (Soal No. {format_numbers(nums)})',
+        })
+    return sections
 
 
 def _s(value):
@@ -407,6 +447,13 @@ def merge_batches(batches, cfg):
         merged["qualitative_analysis"].extend(b["qualitative_analysis"])
         if b["material_summary"]:
             summaries.append(b["material_summary"])
+    # Pastikan soal terkelompok per jenis (PG dulu, lalu Essay, dst.) walaupun AI
+    # menyimpang dari rencana; urutan di dalam satu jenis tetap (sort stabil).
+    qs = merged["questions"]
+    order = sorted(range(len(qs)), key=lambda i: (_type_rank(qs[i]["type"]), i))
+    for key in ("questions", "blueprint", "qualitative_analysis"):
+        if len(merged[key]) == len(order):
+            merged[key] = [merged[key][i] for i in order]
     for i, q in enumerate(merged["questions"], 1):
         q["number"] = i
         merged["blueprint"][i - 1]["number"] = i
@@ -470,11 +517,16 @@ def generate_package(llm, cfg, progress=None):
 
 # ---------------------------------------------------------------- layout helpers
 
-def passage_layout(data):
-    """{nomor soal pertama: (passage, [nomor soal yang memakainya])}."""
+def passage_layout(data, numbers=None):
+    """{nomor soal pertama: (passage, [nomor soal yang memakainya])}.
+
+    `numbers` membatasi pada satu bagian soal, sehingga wacana yang dipakai soal di dua
+    bagian (mis. PG dan Essay) tampil di awal masing-masing bagian."""
     passages = {p["id"]: p for p in data.get("passages", [])}
     groups = {}
     for i, q in enumerate(data["questions"], 1):
+        if numbers is not None and i not in numbers:
+            continue
         if q.get("passage_id") in passages:
             groups.setdefault(q["passage_id"], []).append(i)
     return {nums[0]: (passages[pid], nums) for pid, nums in groups.items()}
@@ -497,36 +549,41 @@ def _esc(text):
 
 def build_preview_html(data):
     """HTML pratinjau yang aman: semua teks AI di-escape dan tanpa baris kosong mentah."""
-    layout = passage_layout(data)
     border = "border:1px solid #dbe4f0;"
     rows = ['<table style="width:100%;border-collapse:collapse;border:1px solid #dbe4f0;">']
-    for i, q in enumerate(data["questions"], 1):
-        if i in layout:
-            p, nums = layout[i]
-            title = f'<b>{_esc(p["title"])}</b><br>' if p.get("title") else ""
-            rows.append(
-                f'<tr><td colspan="2" style="padding:12px;background:#f3f6fb;{border}">'
-                f'<div style="font-size:12px;color:#2457c5;font-weight:700;margin-bottom:6px;">'
-                f'Wacana untuk soal nomor {format_numbers(nums)}</div>'
-                f'<div dir="auto" style="line-height:1.6;">{title}{_esc(p["text"])}</div></td></tr>')
-        stim = ""
-        if q.get("stimulus"):
-            stim = (f'<div dir="auto" style="margin:8px 0;padding:10px;background:#f3f6fb;'
-                    f'border-left:3px solid #2457c5;">{_esc(q["stimulus"])}</div>')
-        opts = ""
-        if q["type"] == "Benar/Salah":
-            opts = '<div style="margin-top:10px;">☐ Benar &nbsp;&nbsp; ☐ Salah</div>'
-        elif q["options"]:
-            opts = '<div style="margin-top:10px;">' + "".join(
-                f'<div dir="auto" style="margin:3px 0;">{_esc(k)}. {_esc(v)}</div>'
-                for k, v in q["options"].items()) + "</div>"
-        meta = (f'<div style="margin-top:10px;color:#64748b;font-size:12px;">'
-                f'{_esc(q["type"])} · Kesulitan: {_esc(q["difficulty"])}</div>')
+    for section in type_sections(data["questions"]):
         rows.append(
-            f'<tr><td style="width:54px;vertical-align:top;padding:12px;background:#eaf2f8;{border}'
-            f'font-weight:700;color:#1f4e79;">{i}</td>'
-            f'<td style="vertical-align:top;padding:12px;{border}"><div dir="auto">{_esc(q["question"])}</div>'
-            f'{stim}{opts}{meta}</td></tr>')
+            f'<tr><td colspan="2" style="padding:10px 12px;background:#1f4e79;color:#fff;'
+            f'font-weight:700;{border}">{_esc(section["label"])}</td></tr>')
+        layout = passage_layout(data, set(section["numbers"]))
+        for i in section["numbers"]:
+            q = data["questions"][i - 1]
+            if i in layout:
+                p, nums = layout[i]
+                title = f'<b>{_esc(p["title"])}</b><br>' if p.get("title") else ""
+                rows.append(
+                    f'<tr><td colspan="2" style="padding:12px;background:#f3f6fb;{border}">'
+                    f'<div style="font-size:12px;color:#2457c5;font-weight:700;margin-bottom:6px;">'
+                    f'Wacana untuk soal nomor {format_numbers(nums)}</div>'
+                    f'<div dir="auto" style="line-height:1.6;">{title}{_esc(p["text"])}</div></td></tr>')
+            stim = ""
+            if q.get("stimulus"):
+                stim = (f'<div dir="auto" style="margin:8px 0;padding:10px;background:#f3f6fb;'
+                        f'border-left:3px solid #2457c5;">{_esc(q["stimulus"])}</div>')
+            opts = ""
+            if q["type"] == "Benar/Salah":
+                opts = '<div style="margin-top:10px;">☐ Benar &nbsp;&nbsp; ☐ Salah</div>'
+            elif q["options"]:
+                opts = '<div style="margin-top:10px;">' + "".join(
+                    f'<div dir="auto" style="margin:3px 0;">{_esc(k)}. {_esc(v)}</div>'
+                    for k, v in q["options"].items()) + "</div>"
+            meta = (f'<div style="margin-top:10px;color:#64748b;font-size:12px;">'
+                    f'{_esc(q["type"])} · Kesulitan: {_esc(q["difficulty"])}</div>')
+            rows.append(
+                f'<tr><td style="width:54px;vertical-align:top;padding:12px;background:#eaf2f8;{border}'
+                f'font-weight:700;color:#1f4e79;">{i}</td>'
+                f'<td style="vertical-align:top;padding:12px;{border}"><div dir="auto">{_esc(q["question"])}</div>'
+                f'{stim}{opts}{meta}</td></tr>')
     rows.append("</table>")
     return "".join(rows)
 
@@ -632,6 +689,28 @@ def _heading(doc, text, level=1):
     return h
 
 
+def _no_split(row):
+    """Baris tabel tidak terpotong di pergantian halaman."""
+    tr_pr = row._tr.get_or_add_trPr()
+    if tr_pr.find(qn("w:cantSplit")) is None:
+        tr_pr.append(OxmlElement("w:cantSplit"))
+
+
+def _repeat_header(row):
+    tr_pr = row._tr.get_or_add_trPr()
+    if tr_pr.find(qn("w:tblHeader")) is None:
+        tr_pr.append(OxmlElement("w:tblHeader"))
+
+
+def _apply_widths(table, widths_in):
+    table.autofit = False
+    for col, w in zip(table.columns, widths_in):
+        col.width = Inches(w)
+    for row in table.rows:
+        for cell, w in zip(row.cells, widths_in):
+            cell.width = Inches(w)
+
+
 def build_docx(data, meta, include_key=True, include_explanations=True,
                include_blueprint=True, include_analysis=True, include_rubric=True,
                include_summary=True):
@@ -659,7 +738,8 @@ def build_docx(data, meta, include_key=True, include_explanations=True,
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         write_par(p, text, size=size, bold=size != 11, color=(31, 78, 121), font="Aptos Display")
 
-    details = [("Sekolah", SCHOOL_NAME), ("Jumlah soal", str(len(data["questions"]))),
+    breakdown = ", ".join(f'{sec["type"]}: {len(sec["numbers"])}' for sec in type_sections(data["questions"]))
+    details = [("Sekolah", SCHOOL_NAME), ("Jumlah soal", f'{len(data["questions"])} ({breakdown})'),
                ("Topik", meta["topic"] or "Sesuai cakupan mata pelajaran"),
                ("Bahasa output", output_language), ("Kesulitan", meta["difficulty"])]
     table = doc.add_table(rows=(len(details) + 1) // 2, cols=2)
@@ -674,115 +754,185 @@ def build_docx(data, meta, include_key=True, include_explanations=True,
     doc.add_paragraph("Nama: ______________________________  Kelas: __________  Tanggal: __________")
 
     questions = data["questions"]
-    layout = passage_layout(data)
-    q_table = doc.add_table(rows=0, cols=2)
-    q_table.style = "Table Grid"
-    q_table.autofit = False
+    sections = type_sections(questions)
     w_num, w_text = Inches(0.6), Inches(6.1)  # total 6.7" = lebar area cetak A4
-    q_table.columns[0].width, q_table.columns[1].width = w_num, w_text
 
-    for idx, q in enumerate(questions, 1):
-        if idx in layout:
-            passage, nums = layout[idx]
-            row = q_table.add_row()
-            merged = row.cells[0].merge(row.cells[1])
-            shade_cell(merged, "F3F6F9")
-            merged.text = ""
-            first = merged.paragraphs[0]
-            first.paragraph_format.space_after = Pt(3)
-            write_par(first, f"Bacalah wacana berikut untuk menjawab soal nomor {format_numbers(nums)}.",
-                      size=9.5, bold=True, color=(31, 78, 121))
-            if passage.get("title"):
-                write_par(merged.add_paragraph(), passage["title"], size=10.5, bold=True)
-            for para in [t for t in passage["text"].split("\n") if t.strip()]:
-                pp = merged.add_paragraph()
-                pp.paragraph_format.space_after = Pt(4)
-                write_par(pp, para.strip(), size=10)
+    for section in sections:
+        _heading(doc, section["label"], 2)
+        instr = doc.add_paragraph()
+        instr.paragraph_format.keep_with_next = True
+        write_par(instr, TYPE_INSTRUCTIONS.get(section["type"], ""), size=10, italic=True,
+                  color=(75, 85, 99))
+        layout = passage_layout(data, set(section["numbers"]))
+        q_table = doc.add_table(rows=0, cols=2)
+        q_table.style = "Table Grid"
+        q_table.autofit = False
+        q_table.columns[0].width, q_table.columns[1].width = w_num, w_text
 
-        cells = q_table.add_row().cells
-        cells[0].width, cells[1].width = w_num, w_text
-        cells[0].vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-        set_cell_text(cells[0], str(idx), bold=True, color=(31, 78, 121), size=10)
-        shade_cell(cells[0], "EAF2F8")
-        cell = cells[1]
-        cell.text = ""
-        p = cell.paragraphs[0]
-        p.paragraph_format.space_after = Pt(4)
-        write_par(p, q["question"], size=10)
-        if q.get("stimulus"):
-            sp = cell.add_paragraph()
-            sp.paragraph_format.space_before = Pt(3)
-            sp.paragraph_format.space_after = Pt(4)
-            write_par(sp, f'Stimulus: {q["stimulus"]}', size=9, italic=True, color=(75, 85, 99))
-        if q["type"] == "Benar/Salah":
-            op = cell.add_paragraph()
-            op.paragraph_format.left_indent = Inches(0.18)
-            write_par(op, "☐ Benar        ☐ Salah", size=10)
-        else:
-            for key, value in (q.get("options") or {}).items():
+        for pos, idx in enumerate(section["numbers"]):
+            q = questions[idx - 1]
+            if idx in layout:
+                passage, nums = layout[idx]
+                row = q_table.add_row()
+                merged = row.cells[0].merge(row.cells[1])
+                shade_cell(merged, "F3F6F9")
+                merged.text = ""
+                first = merged.paragraphs[0]
+                first.paragraph_format.space_after = Pt(3)
+                write_par(first, f"Bacalah wacana berikut untuk menjawab soal nomor {format_numbers(nums)}.",
+                          size=9.5, bold=True, color=(31, 78, 121))
+                if passage.get("title"):
+                    write_par(merged.add_paragraph(), passage["title"], size=10.5, bold=True)
+                for para in [t for t in passage["text"].split("\n") if t.strip()]:
+                    pp = merged.add_paragraph()
+                    pp.paragraph_format.space_after = Pt(4)
+                    write_par(pp, para.strip(), size=10)
+
+            q_row = q_table.add_row()
+            _no_split(q_row)
+            cells = q_row.cells
+            cells[0].width, cells[1].width = w_num, w_text
+            cells[0].vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            set_cell_text(cells[0], str(idx), bold=True, color=(31, 78, 121), size=10)
+            shade_cell(cells[0], "EAF2F8")
+            cell = cells[1]
+            cell.text = ""
+            p = cell.paragraphs[0]
+            p.paragraph_format.space_after = Pt(4)
+            write_par(p, q["question"], size=10)
+            if q.get("stimulus"):
+                sp = cell.add_paragraph()
+                sp.paragraph_format.space_before = Pt(3)
+                sp.paragraph_format.space_after = Pt(4)
+                write_par(sp, f'Stimulus: {q["stimulus"]}', size=9, italic=True, color=(75, 85, 99))
+            if q["type"] == "Benar/Salah":
                 op = cell.add_paragraph()
                 op.paragraph_format.left_indent = Inches(0.18)
-                op.paragraph_format.space_after = Pt(1)
-                op.paragraph_format.keep_together = True
-                write_par(op, f"{key}. {value}", size=10)
-        if q["type"] in ("Isian Singkat", "Essay"):
-            lines = 3 if q["type"] == "Essay" else 1
-            for n in range(lines):
-                al = cell.add_paragraph()
-                al.paragraph_format.space_before = Pt(4)
-                write_par(al, ("Jawaban: " if n == 0 else "") + "_" * (48 if n == 0 else 58), size=10)
-        if idx % 2 == 0:
-            shade_cell(cell, "F8FAFD")
+                write_par(op, "☐ Benar        ☐ Salah", size=10)
+            else:
+                for key, value in (q.get("options") or {}).items():
+                    op = cell.add_paragraph()
+                    op.paragraph_format.left_indent = Inches(0.18)
+                    op.paragraph_format.space_after = Pt(1)
+                    op.paragraph_format.keep_together = True
+                    write_par(op, f"{key}. {value}", size=10)
+            if q["type"] in ("Isian Singkat", "Essay"):
+                lines = 3 if q["type"] == "Essay" else 1
+                for n in range(lines):
+                    al = cell.add_paragraph()
+                    al.paragraph_format.space_before = Pt(4)
+                    write_par(al, ("Jawaban: " if n == 0 else "") + "_" * (48 if n == 0 else 58), size=10)
+            if pos % 2:
+                shade_cell(cell, "F8FAFD")
 
-    def add_dict_table(title, rows, columns):
+    def _num(item):
+        return int(item.get("No.", item.get("number", 0)) or 0)
+
+    def add_dict_table(title, rows, columns, widths, size=8):
+        """Tabel lampiran, dipisah per jenis soal (A. Pilihan Ganda, B. Essay, ...)."""
         if not rows:
             return
         doc.add_page_break()
         _heading(doc, title, 1)
-        t = doc.add_table(rows=1, cols=len(columns))
-        t.style = "Table Grid"
-        for i, key in enumerate(columns):
-            shade_cell(t.rows[0].cells[i], "1F4E79")
-            set_cell_text(t.rows[0].cells[i], COLUMN_LABELS.get(key, key), bold=True,
-                          color=(255, 255, 255), size=8)
-        for n, item in enumerate(rows):
-            cells = t.add_row().cells
+        by_num = {_num(r): r for r in rows}
+        for section in sections:
+            items = [by_num[n] for n in section["numbers"] if n in by_num]
+            if not items:
+                continue
+            _heading(doc, section["label"], 2)
+            t = doc.add_table(rows=1, cols=len(columns))
+            t.style = "Table Grid"
             for i, key in enumerate(columns):
-                value = item.get(key, "—")
-                if isinstance(value, list):
-                    value = ", ".join(map(str, value))
-                set_cell_text(cells[i], value, size=8)
-                if n % 2:
-                    shade_cell(cells[i], "F3F6F9")
+                shade_cell(t.rows[0].cells[i], "1F4E79")
+                set_cell_text(t.rows[0].cells[i], COLUMN_LABELS.get(key, key), bold=True,
+                              color=(255, 255, 255), size=8)
+            _repeat_header(t.rows[0])
+            for n, item in enumerate(items):
+                row = t.add_row()
+                _no_split(row)
+                for i, key in enumerate(columns):
+                    value = item.get(key, "—")
+                    if isinstance(value, list):
+                        value = ", ".join(map(str, value))
+                    set_cell_text(row.cells[i], value, size=size)
+                    if n % 2:
+                        shade_cell(row.cells[i], "F3F6F9")
+            _apply_widths(t, widths)
+
+    def add_answer_key():
+        doc.add_page_break()
+        _heading(doc, "KUNCI JAWABAN", 1)
+        for section in sections:
+            _heading(doc, section["label"], 2)
+            items = [(n, questions[n - 1]["answer"]) for n in section["numbers"]]
+            if section["type"] in ("Pilihan Ganda", "Benar/Salah"):
+                # jawaban pendek (huruf / Benar-Salah): kisi ringkas, 10 nomor per baris
+                per_row = 10
+                chunks = [items[k:k + per_row] for k in range(0, len(items), per_row)]
+                t = doc.add_table(rows=2 * len(chunks), cols=per_row + 1)
+                t.style = "Table Grid"
+                for c, chunk in enumerate(chunks):
+                    head, ans_row = t.rows[2 * c].cells, t.rows[2 * c + 1].cells
+                    for cell, text in ((head[0], "No."), (ans_row[0], "Jawaban")):
+                        shade_cell(cell, "1F4E79" if cell is head[0] else "EAF2F8")
+                        set_cell_text(cell, text, bold=True, size=8.5,
+                                      color=(255, 255, 255) if cell is head[0] else (31, 78, 121))
+                    for j in range(per_row):
+                        shade_cell(head[j + 1], "1F4E79")
+                        if j < len(chunk):
+                            set_cell_text(head[j + 1], str(chunk[j][0]), bold=True, size=9,
+                                          color=(255, 255, 255))
+                            set_cell_text(ans_row[j + 1], chunk[j][1], bold=True, size=11)
+                        for cell in (head[j + 1], ans_row[j + 1]):
+                            cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for row in t.rows:
+                    _no_split(row)
+                _apply_widths(t, [1.0] + [0.57] * per_row)
+            else:
+                t = doc.add_table(rows=1, cols=2)
+                t.style = "Table Grid"
+                for i, label in enumerate(("No.", "Kunci Jawaban")):
+                    shade_cell(t.rows[0].cells[i], "1F4E79")
+                    set_cell_text(t.rows[0].cells[i], label, bold=True, color=(255, 255, 255), size=8)
+                _repeat_header(t.rows[0])
+                for n, (num, ans) in enumerate(items):
+                    row = t.add_row()
+                    _no_split(row)
+                    set_cell_text(row.cells[0], str(num), bold=True, color=(31, 78, 121), size=9)
+                    set_cell_text(row.cells[1], ans, size=9)
+                    if n % 2:
+                        for cell in row.cells:
+                            shade_cell(cell, "F3F6F9")
+                _apply_widths(t, [0.6, 6.1])
 
     if include_key:
-        add_dict_table("KUNCI JAWABAN",
-                       [{"No.": i, "Jawaban": q["answer"], "Jenis": q["type"]}
-                        for i, q in enumerate(questions, 1)],
-                       ["No.", "Jawaban", "Jenis"])
+        add_answer_key()
 
     if include_explanations:
         doc.add_page_break()
         _heading(doc, "PEMBAHASAN", 1)
-        for i, q in enumerate(questions, 1):
-            p = doc.add_paragraph()
-            write_par(p, f"{i}. ", size=10.5, bold=True)
-            write_par(p, q["explanation"], size=10.5)
+        for section in sections:
+            _heading(doc, section["label"], 2)
+            for i in section["numbers"]:
+                p = doc.add_paragraph()
+                write_par(p, f"{i}. ", size=10.5, bold=True)
+                write_par(p, questions[i - 1]["explanation"], size=10.5)
 
     if include_rubric:
         add_dict_table("RUBRIK PENILAIAN",
-                       [{"No.": i, "Jenis": q["type"], "Rubrik": q["scoring_rubric"]}
-                        for i, q in enumerate(questions, 1)],
-                       ["No.", "Jenis", "Rubrik"])
+                       [{"No.": i, "Rubrik": q["scoring_rubric"]} for i, q in enumerate(questions, 1)],
+                       ["No.", "Rubrik"], [0.6, 6.1], size=9)
 
     if include_blueprint:
         add_dict_table("KISI-KISI SOAL", data.get("blueprint", []),
                        ["number", "topic", "competency", "indicator", "cognitive_level",
-                        "difficulty", "question_type"])
+                        "difficulty", "question_type"],
+                       [0.45, 1.0, 1.15, 1.8, 0.65, 0.75, 0.9])
 
     if include_analysis:
         add_dict_table("ANALISIS KUALITATIF SOAL", data.get("qualitative_analysis", []),
-                       ["number", "content_validity", "construction", "language", "notes"])
+                       ["number", "content_validity", "construction", "language", "notes"],
+                       [0.45, 1.9, 1.8, 1.3, 1.25])
 
     if include_summary and data.get("material_summary"):
         doc.add_page_break()
